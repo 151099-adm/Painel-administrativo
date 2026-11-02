@@ -12,7 +12,7 @@ Dashboard de gestão de tarefas administrativas por obra, com priorização (mat
 
 ## Estrutura de dados (Firestore)
 
-Quatro coleções:
+Cinco coleções:
 
 - **`boards/shared`** — documento único com o quadro **compartilhado** entre todos os usuários, e liberado para qualquer usuário autenticado ler/escrever. Campo principal:
   - `tarefas_matriz_compartilhado` (ou `tarefas_matriz_privado` no modo privado): JSON com `{tasks, categoryColors, rotinaHistorico}`
@@ -31,6 +31,8 @@ Quatro coleções:
 
 - **`attachments/{id}`** — um documento por arquivo anexado (Diretrizes/Seções), até ~700KB em base64. Leitura liberada a todos; escrita travada a admin pela regra do Firestore.
 
+- **`demandas/{id}`** — um documento por demanda (pedido que chega por WhatsApp, e-mail ou da obra). Campos: `descricao`, `obra`, `solicitante`, `origem`, `prazo`, `responsavel`, `responsavelEmail`, `status` (nova, andamento, aguardando, concluida, cancelada), `criadoEm`, `criadoPor`, `criadoPorEmail`, `atualizadoEm`, `encerradaEm` e `historico[]` (`{em, por, texto}`). Leitura, criação e edição liberadas a qualquer usuário autenticado; **exclusão só admin**; as regras impedem alterar autor/data de criação e encurtar o histórico (trilha de auditoria). O painel carrega só as demandas em aberto + as encerradas nos últimos 90 dias (duas consultas), com cache de 5 minutos, para respeitar a cota gratuita de leituras.
+
 - **`admins/{uid}`** — a existência de um documento com o UID da pessoa é o que define se ela é administradora. **Não existe mais senha de promoção a admin** — a promoção é feita manualmente pelo Firebase Console (Firestore → coleção `admins` → criar documento com o UID da pessoa, pego em Authentication → Users).
 
 Toda leitura/escrita passa pelas funções `storageGet(key, isShared)` / `storageSet(key, value, isShared)`, mais funções dedicadas para os dados administrativos (`loadAdminSettings()` / `saveAdminSettings()`), perfis (`loadPerfis()` / `savePerfis()`) e anexos (`saveAttachment()` / `loadAttachment()`).
@@ -46,27 +48,53 @@ service cloud.firestore {
              request.auth.token.email.matches('.*@seel[.]com[.]br$') &&
              request.auth.token.email_verified == true;
     }
+
     function isAdmin() {
       return isSeelUser() &&
              exists(/databases/$(database)/documents/admins/$(request.auth.uid));
     }
+
+    function demandaValida() {
+      let d = request.resource.data;
+      return d.descricao is string && d.descricao.size() > 0 && d.descricao.size() <= 1000
+          && d.obra is string && d.obra.size() > 0
+          && d.responsavel is string && d.responsavel.size() > 0
+          && d.status in ['nova', 'andamento', 'aguardando', 'concluida', 'cancelada']
+          && d.historico is list;
+    }
+
     match /boards/shared {
       allow read, write: if isSeelUser();
     }
+
     match /boards/admin_settings {
       allow read: if isSeelUser();
       allow write: if isAdmin();
     }
+
     match /users/{userId} {
       allow read, write: if isSeelUser() && request.auth.uid == userId;
     }
+
     match /attachments/{attachmentId} {
       allow read: if isSeelUser();
       allow write: if isAdmin();
     }
+
     match /admins/{uid} {
       allow read: if isSeelUser() && request.auth.uid == uid;
       allow write: if false;
+    }
+
+    match /demandas/{demandaId} {
+      allow read: if isSeelUser();
+      allow create: if isSeelUser() && demandaValida()
+                    && request.resource.data.criadoPorEmail == request.auth.token.email;
+      allow update: if isSeelUser() && demandaValida()
+                    && request.resource.data.criadoPorEmail == resource.data.criadoPorEmail
+                    && request.resource.data.criadoEm == resource.data.criadoEm
+                    && request.resource.data.historico.size() >= resource.data.historico.size();
+      allow delete: if isAdmin();
     }
   }
 }
@@ -81,6 +109,7 @@ service cloud.firestore {
 
 ## Funcionalidades implementadas
 
+- **Portal de Demandas** (menu "Demandas"): registro rápido (descrição, obra, prazo; origem, solicitante e responsável com sugestão automática pelo administrativo da obra de menor carga), "Minha fila" por pessoa, "Todas as demandas" com filtros e busca e, para admin, "Carga da equipe" (em aberto, atrasadas, próximos 7 dias, concluídas em 30 dias, tempo médio e origem das demandas). Cada alteração fica no histórico da demanda.
 - Matriz de priorização (4 quadrantes, drag-and-drop, com "Mover para ▾" como alternativa em touch/mobile)
 - 31 obras pré-carregadas a partir de planilha real da empresa (`OBRAS_SEED`, hardcoded no JS)
 - SLA configurável por quadrante, com alerta visual de atraso (admin-only)
@@ -95,7 +124,13 @@ service cloud.firestore {
 - Tema claro/escuro, cartão de perfil (iniciais + nome) no topo, ícones no menu
 - Obras "encerradas" somem da lista pra usuários comuns; obras podem ser marcadas como visíveis só a admin
 
+## Segurança de entrada de dados
+
+Todo texto digitado por usuários (nomes, obras, tarefas, demandas) é inserido na tela com `textContent` ou passa por `esc()` antes de entrar em `innerHTML`, para evitar injeção de HTML/JS (XSS armazenado). Ao criar novos trechos de interface, **nunca** concatenar texto de usuário em `innerHTML` sem `esc()`.
+
 ## Limitações conhecidas / dívidas técnicas
+
+- **Demandas**: sem notificação automática (e-mail/WhatsApp) e sem anexos; entrada por canal externo (WhatsApp/e-mail) é manual. Demandas encerradas há mais de 90 dias não aparecem na tela (continuam no banco e no backup).
 
 - **Arquivo único monolítico** (~2900 linhas HTML+CSS+JS inline). Recomendado dividir em módulos antes de crescer muito mais.
 - **Sem testes automatizados.**
